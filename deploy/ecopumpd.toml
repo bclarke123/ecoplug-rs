@@ -7,6 +7,11 @@ timezone = "America/Toronto"
 # several interfaces on the plug's subnet (default 0.0.0.0).
 # bind = "10.1.1.10"
 poll_interval_secs = 120
+
+# HTTP API used by the CLI and by Home Assistant. Keep it on localhost unless
+# another host needs it, in which case set a token as well.
+listen = "127.0.0.1:8090"
+# token = "change-me"
 override_file = "/var/lib/ecopumpd/override"
 
 # The pump is ON whenever the current local time falls inside any window.

@@ -1,9 +1,11 @@
 //! `ecopumpd`: schedule and control an ECO Plugs pool-pump timer over local UDP.
 //!
-//! Run `ecopumpd --help` for the subcommands. The `run` subcommand is the
-//! long-lived daemon; the others are one-shot tools that replace the old
-//! Python script.
+//! Run `ecopumpd --help` for the subcommands. `run` is the long-lived daemon
+//! and the only thing that talks to the plug; every other subcommand except
+//! `discover` is a client of the daemon's HTTP API and fails if it is down.
 
+mod api;
+mod client;
 mod config;
 mod overrides;
 mod proto;
@@ -17,14 +19,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono_tz::Tz;
 use clap::{Args, Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use api::{OverrideRequest, SetRequest, Status};
 use config::Config;
-use overrides::Override;
-use proto::{Client, Power};
+use proto::Power;
 use schedule::Hm;
 
 #[derive(Debug, Parser)]
@@ -33,26 +36,30 @@ struct Cli {
     /// Path to the TOML config file.
     #[arg(short, long, global = true, default_value = config::DEFAULT_PATH)]
     config: PathBuf,
+    /// Print raw JSON instead of a human-readable summary.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Run the reconcile loop as a daemon.
+    /// Run the reconcile loop and HTTP API as a daemon.
     Run,
-    /// Broadcast discovery and list every plug that answers.
+    /// Broadcast discovery and list every plug that answers (talks to the
+    /// plug directly; stop the daemon first).
     Discover {
         /// Broadcast address to use. By default both 255.255.255.255 and the
         /// /24 directed broadcast of the config host are tried.
         #[arg(long)]
         broadcast: Option<Ipv4Addr>,
     },
-    /// Print the plug's current relay state.
+    /// Print the plug's last observed relay state.
     State,
-    /// Switch the plug on.
+    /// Hold the pump on until the next scheduled transition.
     On,
-    /// Switch the plug off.
+    /// Hold the pump off until the next scheduled transition.
     Off,
     /// Manage a temporary override of the schedule.
     #[command(subcommand)]
@@ -133,31 +140,97 @@ fn main() -> ExitCode {
     }
 }
 
+fn api_client(cfg: &Config) -> client::Client {
+    client::Client::new(cfg.listen, cfg.token.clone())
+}
+
 fn dispatch(cli: Cli) -> Result<()> {
-    match cli.cmd {
-        Cmd::Run => {
-            let cfg = Config::load(&cli.config)?;
-            reconcile::run(&cli.config, cfg)
-        }
-        Cmd::Discover { broadcast } => discover(&cli.config, broadcast),
+    if let Cmd::Discover { broadcast } = cli.cmd {
+        return discover(&cli.config, broadcast);
+    }
+    let cfg = Config::load(&cli.config)?;
+    if let Cmd::Run = cli.cmd {
+        return reconcile::run(&cli.config, cfg);
+    }
+    let api = api_client(&cfg);
+    let status = match cli.cmd {
         Cmd::State => {
-            let cfg = Config::load(&cli.config)?;
-            let state = Client::bind(cfg.bind)?.get_state(&cfg.device_id, cfg.host)?;
-            println!("{state}");
-            Ok(())
+            let st = api.status()?;
+            match st.actual {
+                Some(p) => println!("{p}"),
+                None => bail!("plug has not answered yet"),
+            }
+            return Ok(());
         }
-        Cmd::On => set(&cli.config, Power::On),
-        Cmd::Off => set(&cli.config, Power::Off),
-        Cmd::Override(cmd) => override_cmd(&cli.config, cmd),
-        Cmd::Status => status(&cli.config),
+        Cmd::On => api.set(SetRequest { power: Power::On })?,
+        Cmd::Off => api.set(SetRequest { power: Power::Off })?,
+        Cmd::Override(OverrideCmd::Clear) => api.clear_override()?,
+        Cmd::Override(OverrideCmd::On(u)) => api.set_override(OverrideRequest {
+            power: Power::On,
+            until: until_time(&cfg, u)?,
+        })?,
+        Cmd::Override(OverrideCmd::Off(u)) => api.set_override(OverrideRequest {
+            power: Power::Off,
+            until: until_time(&cfg, u)?,
+        })?,
+        Cmd::Status => api.status()?,
+        Cmd::Run | Cmd::Discover { .. } => unreachable!("handled above"),
+    };
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print_status(&status, cfg.timezone);
+    }
+    Ok(())
+}
+
+fn until_time(cfg: &Config, u: Until) -> Result<DateTime<Utc>> {
+    match (u.for_, u.until) {
+        (Some(d), _) => Ok(Utc::now() + ChronoDuration::from_std(d).context("duration too large")?),
+        (None, Some(hm)) => Ok(next_occurrence(cfg.timezone, hm)),
+        (None, None) => bail!("specify --for or --until"),
     }
 }
 
-fn set(config: &Path, power: Power) -> Result<()> {
-    let cfg = Config::load(config)?;
-    Client::bind(cfg.bind)?.set_state(&cfg.device_id, cfg.host, power)?;
-    println!("{power}");
-    Ok(())
+/// The next time `hm` occurs in `tz`, strictly after now.
+fn next_occurrence(tz: Tz, hm: Hm) -> DateTime<Utc> {
+    use chrono::{NaiveTime, TimeZone};
+    let now = Utc::now().with_timezone(&tz);
+    let time = NaiveTime::from_hms_opt(u32::from(hm.minutes() / 60), u32::from(hm.minutes() % 60), 0)
+        .expect("Hm is validated");
+    for offset in 0..3 {
+        let date = now.date_naive() + ChronoDuration::days(offset);
+        // `earliest` skips a wall time that does not exist on a DST day.
+        if let Some(t) = tz.from_local_datetime(&date.and_time(time)).earliest()
+            && t > now
+        {
+            return t.with_timezone(&Utc);
+        }
+    }
+    unreachable!("a valid HH:MM occurs within three days")
+}
+
+fn print_status(st: &Status, tz: Tz) {
+    let fmt = |t: DateTime<Utc>| t.with_timezone(&tz).format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    println!("now:        {}", fmt(st.now));
+    println!("schedule:   {}", st.schedule);
+    match st.r#override {
+        Some(o) => println!("override:   {} until {}", o.power, fmt(o.until)),
+        None => println!("override:   none"),
+    }
+    println!("desired:    {}", st.desired);
+    match (st.actual, st.last_poll) {
+        (Some(a), Some(t)) => {
+            let sync = if a == st.desired { "" } else { "  (out of sync)" };
+            let stale = if st.reachable { "" } else { ", plug unreachable" };
+            println!("actual:     {a}{sync}  (as of {}{stale})", fmt(t));
+        }
+        _ => println!("actual:     unknown (plug has not answered yet)"),
+    }
+    match st.next {
+        Some(n) => println!("next:       {} at {}", n.power, fmt(n.at)),
+        None => println!("next:       none within a week"),
+    }
 }
 
 fn discover(config: &Path, broadcast: Option<Ipv4Addr>) -> Result<()> {
@@ -173,95 +246,12 @@ fn discover(config: &Path, broadcast: Option<Ipv4Addr>) -> Result<()> {
         _ => {}
     }
     info!(?targets, "broadcasting discovery");
-    let devices = Client::bind(local)?.discover(&targets)?;
+    let devices = proto::Client::bind(local)?.discover(&targets)?;
     if devices.is_empty() {
         bail!("no devices answered discovery on {targets:?}");
     }
     for d in devices {
         println!("{d}");
-    }
-    Ok(())
-}
-
-fn override_cmd(config: &Path, cmd: OverrideCmd) -> Result<()> {
-    let cfg = Config::load(config)?;
-    let path = &cfg.override_file;
-    let (power, until) = match cmd {
-        OverrideCmd::Clear => {
-            overrides::clear(path)?;
-            println!("override cleared");
-            return Ok(());
-        }
-        OverrideCmd::On(u) => (Power::On, u),
-        OverrideCmd::Off(u) => (Power::Off, u),
-    };
-    let now = Utc::now();
-    let until = match (until.for_, until.until) {
-        (Some(d), _) => now + ChronoDuration::from_std(d).context("duration too large")?,
-        (None, Some(hm)) => next_occurrence(&cfg, hm),
-        (None, None) => bail!("specify --for or --until"),
-    };
-    let ov = Override { power, until };
-    overrides::write(path, ov)?;
-    println!(
-        "override {} (local {})",
-        ov,
-        until.with_timezone(&cfg.timezone).format("%Y-%m-%d %H:%M %Z")
-    );
-    println!("the daemon applies it within its poll interval");
-    Ok(())
-}
-
-/// The next time `hm` occurs in the configured timezone, strictly after now.
-fn next_occurrence(cfg: &Config, hm: Hm) -> chrono::DateTime<Utc> {
-    use chrono::{NaiveTime, TimeZone};
-    let now = Utc::now().with_timezone(&cfg.timezone);
-    let time = NaiveTime::from_hms_opt(u32::from(hm.minutes() / 60), u32::from(hm.minutes() % 60), 0)
-        .expect("Hm is validated");
-    for offset in 0..3 {
-        let date = now.date_naive() + ChronoDuration::days(offset);
-        // `earliest` skips a wall time that does not exist on a DST day.
-        if let Some(t) = cfg.timezone.from_local_datetime(&date.and_time(time)).earliest()
-            && t > now
-        {
-            return t.with_timezone(&Utc);
-        }
-    }
-    unreachable!("a valid HH:MM occurs within three days")
-}
-
-fn status(config: &Path) -> Result<()> {
-    let cfg = Config::load(config)?;
-    let now = Utc::now();
-    let local = now.with_timezone(&cfg.timezone);
-    let scheduled = Power::from_bool(cfg.schedule.desired(local));
-    let ov = overrides::read(&cfg.override_file, now)?;
-    let desired = ov.map_or(scheduled, |o| o.power);
-    println!("now:        {}", local.format("%Y-%m-%d %H:%M:%S %Z"));
-    println!("schedule:   {scheduled}");
-    match ov {
-        Some(o) => println!(
-            "override:   {} until {}",
-            o.power,
-            o.until.with_timezone(&cfg.timezone).format("%Y-%m-%d %H:%M %Z")
-        ),
-        None => println!("override:   none"),
-    }
-    println!("desired:    {desired}");
-    match Client::bind(cfg.bind).and_then(|c| c.get_state(&cfg.device_id, cfg.host)) {
-        Ok(actual) => println!(
-            "actual:     {actual}{}",
-            if actual == desired { "" } else { "  (out of sync)" }
-        ),
-        Err(e) => println!("actual:     unknown ({e:#})"),
-    }
-    match cfg.schedule.next_transition(local) {
-        Some((t, on)) => println!(
-            "next:       {} at {}",
-            Power::from_bool(on),
-            t.format("%Y-%m-%d %H:%M %Z")
-        ),
-        None => println!("next:       none within a week"),
     }
     Ok(())
 }

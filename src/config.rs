@@ -3,7 +3,7 @@
 //! See `deploy/ecopumpd.toml` for an annotated example.
 
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,6 +25,10 @@ struct RawConfig {
     timezone: String,
     #[serde(default = "default_bind")]
     bind: String,
+    #[serde(default = "default_listen")]
+    listen: String,
+    #[serde(default)]
+    token: Option<String>,
     #[serde(default = "default_poll")]
     poll_interval_secs: u64,
     #[serde(default = "default_override_file")]
@@ -46,6 +50,10 @@ fn default_bind() -> String {
     "0.0.0.0".to_owned()
 }
 
+fn default_listen() -> String {
+    "127.0.0.1:8090".to_owned()
+}
+
 fn default_poll() -> u64 {
     120
 }
@@ -62,6 +70,10 @@ pub struct Config {
     pub timezone: Tz,
     /// Local address to bind the reply socket to; only matters on multi-homed hosts.
     pub bind: IpAddr,
+    /// Address the HTTP API listens on.
+    pub listen: SocketAddr,
+    /// Optional bearer token required by the HTTP API.
+    pub token: Option<String>,
     pub poll_interval: Duration,
     pub override_file: PathBuf,
     pub schedule: Schedule,
@@ -92,6 +104,13 @@ impl Config {
             .bind
             .parse()
             .with_context(|| format!("bind {:?} is not an IP address", raw.bind))?;
+        let listen = raw
+            .listen
+            .parse()
+            .with_context(|| format!("listen {:?} is not host:port", raw.listen))?;
+        if raw.token.as_deref() == Some("") {
+            bail!("token must not be empty; omit it to disable auth");
+        }
         if raw.poll_interval_secs == 0 {
             bail!("poll_interval_secs must be > 0");
         }
@@ -113,6 +132,8 @@ impl Config {
             host,
             timezone,
             bind,
+            listen,
+            token: raw.token,
             poll_interval: Duration::from_secs(raw.poll_interval_secs),
             override_file: raw.override_file,
             schedule: Schedule::new(windows),

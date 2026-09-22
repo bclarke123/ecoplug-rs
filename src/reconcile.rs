@@ -3,22 +3,21 @@
 //! Every poll the loop computes the desired state (override first, then
 //! schedule), reads the plug, and corrects it only when they differ. This
 //! self-heals after missed packets, power cuts and manual button presses.
-//! The loop sleeps in short slices so it can wake early on SIGTERM, SIGHUP
-//! (config reload) or a change to the override file.
+//! Observations are published into [`State`] for the HTTP API, and the API
+//! wakes the loop whenever an override changes.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use tracing::{debug, error, info, warn};
 
+use crate::api::{self, State};
 use crate::config::Config;
-use crate::overrides;
 use crate::proto::{Client, Power};
 
 /// Upper bound on the poll interval while the plug is unreachable.
@@ -27,7 +26,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const WARN_EVERY: Duration = Duration::from_secs(300);
 /// After this long unreachable, warn that the outage is prolonged.
 const PROLONGED_OUTAGE: Duration = Duration::from_secs(30 * 60);
-/// Granularity of the interruptible sleep.
+/// Granularity at which the sleep checks for signals.
 const TICK: Duration = Duration::from_secs(1);
 
 /// Process-wide signal flags.
@@ -52,6 +51,10 @@ impl Signals {
         self.shutdown.load(Ordering::Relaxed)
     }
 
+    fn reload_pending(&self) -> bool {
+        self.reload.load(Ordering::Relaxed)
+    }
+
     fn take_reload(&self) -> bool {
         self.reload.swap(false, Ordering::Relaxed)
     }
@@ -72,7 +75,11 @@ impl Outage {
         let since = *self.since.get_or_insert(now);
         let elapsed = now.duration_since(since);
         if self.last_warned.is_none_or(|t| now.duration_since(t) >= WARN_EVERY) {
-            warn!(error = %err, unreachable_for_secs = elapsed.as_secs(), "plug unreachable");
+            warn!(
+                error = format!("{err:#}"),
+                unreachable_for_secs = elapsed.as_secs(),
+                "plug unreachable"
+            );
             self.last_warned = Some(now);
         }
         if elapsed >= PROLONGED_OUTAGE && !self.prolonged_warned {
@@ -101,84 +108,95 @@ impl Outage {
     }
 }
 
-fn mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Sleeps up to `dur`, returning early on shutdown, reload, or override change.
-fn sleep_interruptible(dur: Duration, signals: &Signals, override_file: &Path) {
-    let start_mtime = mtime(override_file);
+/// Sleeps up to `dur`, returning early on shutdown, reload, or an API wake.
+fn sleep_interruptible(dur: Duration, signals: &Signals, state: &State) {
     let deadline = Instant::now() + dur;
     while let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
-        thread::sleep(left.min(TICK));
-        if signals.shutting_down() || signals.reload.load(Ordering::Relaxed) {
+        let before = Instant::now();
+        state.wait(left.min(TICK));
+        if signals.shutting_down() || signals.reload_pending() {
             return;
         }
-        if mtime(override_file) != start_mtime {
-            info!("override file changed, waking early");
+        // Returned before the tick elapsed: the API woke us.
+        if before.elapsed() < left.min(TICK) {
+            debug!("woken by api");
             return;
         }
     }
 }
 
-/// Runs the reconcile loop until SIGTERM or SIGINT.
+/// Runs the reconcile loop and API server until SIGTERM or SIGINT.
 ///
 /// `config_path` is re-read on SIGHUP; a bad new config is logged and the
 /// previous one kept.
-pub fn run(config_path: &Path, mut config: Config) -> Result<()> {
+pub fn run(config_path: &Path, config: Config) -> Result<()> {
     let signals = Signals::register()?;
     let client = Client::bind(config.bind)?;
-    let mut outage = Outage::default();
-    let mut last_desired: Option<Power> = None;
     info!(
         device_id = %config.device_id, host = %config.host, timezone = %config.timezone,
         poll_secs = config.poll_interval.as_secs(), windows = config.schedule.windows().len(),
         "ecopumpd starting"
     );
+    let state = State::new(config);
+    api::serve(state.clone())?;
+    let mut outage = Outage::default();
+    let mut last_desired: Option<Power> = None;
 
     while !signals.shutting_down() {
         if signals.take_reload() {
             match Config::load(config_path) {
                 Ok(c) => {
                     info!(windows = c.schedule.windows().len(), "config reloaded");
-                    config = c;
+                    state.with(|s| s.config = c);
                 }
                 Err(e) => error!(error = %e, "config reload failed, keeping previous config"),
             }
         }
 
-        let now = Utc::now();
-        let ov = match overrides::read(&config.override_file, now) {
-            Ok(ov) => ov,
-            Err(e) => {
-                error!(error = %e, "cannot read override file, using schedule");
-                None
-            }
-        };
-        let scheduled = Power::from_bool(config.schedule.desired(now.with_timezone(&config.timezone)));
-        let desired = ov.map_or(scheduled, |o| o.power);
-        if last_desired != Some(desired) {
-            let source = if ov.is_some() { "override" } else { "schedule" };
-            info!(%desired, source, "desired state changed");
-            last_desired = Some(desired);
+        let st = state.status();
+        let (device_id, host, poll) =
+            state.with(|s| (s.config.device_id.clone(), s.config.host, s.config.poll_interval));
+        if last_desired != Some(st.desired) {
+            let source = if st.r#override.is_some() {
+                "override"
+            } else {
+                "schedule"
+            };
+            info!(desired = %st.desired, source, "desired state changed");
+            last_desired = Some(st.desired);
         }
 
-        let wait = match client.get_state(&config.device_id, config.host) {
-            Err(e) => outage.record_failure(&e, config.poll_interval),
+        let wait = match client.get_state(&device_id, host) {
+            Err(e) => {
+                state.with(|s| {
+                    s.reachable = false;
+                    s.last_poll = Some(Utc::now());
+                });
+                outage.record_failure(&e, poll)
+            }
             Ok(actual) => {
                 outage.record_success();
-                if actual == desired {
+                let mut observed = actual;
+                if actual == st.desired {
                     debug!(state = %actual, "in sync");
                 } else {
-                    match client.set_state(&config.device_id, config.host, desired) {
-                        Ok(()) => info!(from = %actual, to = %desired, "corrected plug state"),
-                        Err(e) => warn!(error = %e, wanted = %desired, "failed to correct plug state"),
+                    match client.set_state(&device_id, host, st.desired) {
+                        Ok(()) => {
+                            observed = st.desired;
+                            info!(from = %actual, to = %st.desired, "corrected plug state");
+                        }
+                        Err(e) => warn!(error = %e, wanted = %st.desired, "failed to correct plug state"),
                     }
                 }
-                config.poll_interval
+                state.with(|s| {
+                    s.reachable = true;
+                    s.actual = Some(observed);
+                    s.last_poll = Some(Utc::now());
+                });
+                poll
             }
         };
-        sleep_interruptible(wait, &signals, &config.override_file);
+        sleep_interruptible(wait, &signals, &state);
     }
     info!("ecopumpd stopping");
     Ok(())
