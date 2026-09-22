@@ -1,0 +1,18 @@
+# ecopumpd configuration. Install to /etc/ecopumpd.toml.
+
+device_id = "ECO-780D4D7D"
+host = "10.1.1.169"
+timezone = "America/Toronto"
+# Optional: local IP to bind the reply socket to. Only needed on hosts with
+# several interfaces on the plug's subnet (default 0.0.0.0).
+# bind = "10.1.1.10"
+poll_interval_secs = 120
+override_file = "/var/lib/ecopumpd/override"
+
+# The pump is ON whenever the current local time falls inside any window.
+# A window whose end is earlier than its start crosses midnight and belongs
+# to the day it starts on. `days` is optional and defaults to every day.
+[[windows]]
+start = "09:00"
+end   = "17:00"
+days  = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]

@@ -1,0 +1,22 @@
+[Unit]
+Description=ECO Plugs pool pump scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ecopumpd
+Group=ecopumpd
+ExecStart=/usr/local/bin/ecopumpd run --config /etc/ecopumpd.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+StateDirectory=ecopumpd
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

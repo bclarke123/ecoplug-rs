@@ -1,0 +1,28 @@
+[package]
+name = "ecopumpd"
+version = "0.1.0"
+edition = "2024"
+description = "Keeps an ECO Plugs / Dewenwils HOWT01A pool-pump timer on a schedule over its local UDP protocol"
+license = "MIT"
+
+[[bin]]
+name = "ecopumpd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+signal-hook = "0.3"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
