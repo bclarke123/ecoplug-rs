@@ -28,6 +28,19 @@ const WARN_EVERY: Duration = Duration::from_secs(300);
 const PROLONGED_OUTAGE: Duration = Duration::from_secs(30 * 60);
 /// Granularity at which the sleep checks for signals.
 const TICK: Duration = Duration::from_secs(1);
+/// Extra delay past a scheduled transition so the poll lands just after it.
+const TRANSITION_MARGIN: Duration = Duration::from_millis(500);
+
+/// Shortens `wait` so the loop wakes right after `next` if that comes first.
+///
+/// Without this the poll phase drifts by the UDP round-trip every cycle and
+/// a transition can be acted on up to a full poll interval late.
+fn clamp_to_transition(wait: Duration, now: chrono::DateTime<Utc>, next: Option<chrono::DateTime<Utc>>) -> Duration {
+    match next.and_then(|t| (t - now).to_std().ok()) {
+        Some(until) => wait.min(until + TRANSITION_MARGIN),
+        None => wait,
+    }
+}
 
 /// Process-wide signal flags.
 #[derive(Debug, Clone)]
@@ -196,8 +209,34 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
                 poll
             }
         };
+        let wait = clamp_to_transition(wait, Utc::now(), st.next.map(|n| n.at));
         sleep_interruptible(wait, &signals, &state);
     }
     info!("ecopumpd stopping");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn wakes_for_transition_when_sooner() {
+        let now = Utc.timestamp_opt(1_000_000, 0).unwrap();
+        let poll = Duration::from_secs(120);
+        let soon = now + chrono::Duration::seconds(30);
+        assert_eq!(
+            clamp_to_transition(poll, now, Some(soon)),
+            Duration::from_millis(30_500)
+        );
+        let later = now + chrono::Duration::seconds(600);
+        assert_eq!(clamp_to_transition(poll, now, Some(later)), poll);
+        assert_eq!(clamp_to_transition(poll, now, None), poll);
+        // A transition already in the past never yields a negative wait.
+        assert_eq!(
+            clamp_to_transition(poll, now, Some(now - chrono::Duration::seconds(5))),
+            poll
+        );
+    }
 }
