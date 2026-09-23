@@ -33,6 +33,7 @@ Little-endian unless stated. The plug listens on UDP 80 (commands) and 25
 | 327938 | SCHEDULE_DELETE | full table without the removed entry |
 | 327939 | SCHEDULE_GETALL | none; reply carries the 388-byte table |
 | 327940 | GET_TODAY_TASKTAB | reply: 1 count byte + 20 × 7-byte windows |
+| 327730 | READ_PWR_OFFSET | 56-byte `BoxPowerDetect` with a date range; reply carries the same block filled in |
 | 327685 | GET_SETTING | reply: 364-byte `BoxSetting`, `TimeZone` at offset 104 |
 | 327701 | MODIFY_TIMEZONE | 12-byte `TimeZone`; the app uses it only as a DST toggle |
 
@@ -86,6 +87,32 @@ matters. With the flag off, on-device timers fire an hour late in summer.
 | 25 | 1 | end day | today |
 | 26 | 1 | end status | 0 = switch off |
 | 28 | 4 | end time | seconds since midnight |
+
+## Metering block (`BoxPowerDetect`, 56 bytes)
+
+| Offset | Size | Field |
+|-------:|-----:|-------|
+| 0 | 1 | flag (high bits of the energy total) |
+| 4 | 4 | start year (request) |
+| 8 | 1 | start month |
+| 9 | 1 | start day |
+| 12 | 4 | end year (request) |
+| 16 | 1 | end month |
+| 17 | 1 | end day |
+| 20 | 4 | energy total, raw |
+| 24 | 4 | current, raw pulse period in µs |
+| 28 | 4 | power, raw |
+| 32 | 4 | voltage, raw |
+| 36 | 4 | energy calibration divisor |
+| 40 | 4 | current calibration divisor |
+| 44 | 4 | power calibration divisor |
+| 48 | 4 | voltage calibration divisor |
+| 52 | 4 | energy now, raw |
+
+The app converts `x = 1 / (raw × 1e-6) / divisor` and scales by 1e3 for amps,
+1e5 for volts and 1e6 for watts; energy is `(flag × 2^32 + raw) × 100 /
+divisor` kWh. All-zero current, voltage and power means the model has no meter
+(the HOWT01A does not; it still answers the command).
 
 ## Discovery
 

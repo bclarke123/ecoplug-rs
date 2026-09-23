@@ -35,6 +35,10 @@ const VCMD_SCHEDULE_GETALL: u32 = 327_939;
 const VCMD_GET_SETTING: u32 = 327_685;
 /// Sets the DST flag via a 12-byte `TimeZone` with magic values (see [`Client::set_dst`]).
 const VCMD_MODIFY_TIMEZONE: u32 = 327_701;
+/// Reads the metering block (`BoxPowerDetect`); the request carries a date range.
+const VCMD_READ_POWER: u32 = 327_730;
+/// Size of the `BoxPowerDetect` block.
+const POWER_LEN: usize = 56;
 /// Offset of the `TimeZone` block inside `BoxSetting`.
 const SETTING_TZ_OFFSET: usize = 104;
 /// Bit set in the year field when daylight saving is on.
@@ -292,6 +296,120 @@ impl fmt::Display for PlugClock {
             hms(self.secs),
             self.dst,
             self.offset_secs
+        )
+    }
+}
+
+/// Raw metering block as the plug reports it (`BoxPowerDetect`).
+///
+/// `amps_raw`, `volts_raw` and `watts_raw` are pulse periods in microseconds
+/// and the `*_offset` fields are factory calibration divisors; see the
+/// `amps()`/`volts()`/`watts()`/`kwh()` helpers for the app's conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PowerReading {
+    pub flag: u8,
+    pub energy_raw: u32,
+    pub amps_raw: u32,
+    pub watts_raw: u32,
+    pub volts_raw: u32,
+    pub energy_offset: u32,
+    pub amps_offset: u32,
+    pub watts_offset: u32,
+    pub volts_offset: u32,
+    pub energy_now_raw: u32,
+}
+
+impl PowerReading {
+    /// Builds the request payload: a date range for the energy total.
+    fn request(start: (u16, u8, u8), end: (u16, u8, u8)) -> [u8; POWER_LEN] {
+        let mut b = [0u8; POWER_LEN];
+        b[4..8].copy_from_slice(&u32::from(start.0).to_le_bytes());
+        b[8] = start.1;
+        b[9] = start.2;
+        b[12..16].copy_from_slice(&u32::from(end.0).to_le_bytes());
+        b[16] = end.1;
+        b[17] = end.2;
+        b
+    }
+
+    /// Parses the 56-byte reply block.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < POWER_LEN {
+            return None;
+        }
+        let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Some(Self {
+            flag: b[0],
+            energy_raw: u32_at(20),
+            amps_raw: u32_at(24),
+            watts_raw: u32_at(28),
+            volts_raw: u32_at(32),
+            energy_offset: u32_at(36),
+            amps_offset: u32_at(40),
+            watts_offset: u32_at(44),
+            volts_offset: u32_at(48),
+            energy_now_raw: u32_at(52),
+        })
+    }
+
+    /// Whether the plug has metering hardware; the app treats all-zero as "no".
+    pub fn supported(&self) -> bool {
+        self.amps_raw != 0 || self.volts_raw != 0 || self.watts_raw != 0
+    }
+
+    fn convert(raw: u32, offset: u32, scale: f64) -> Option<f64> {
+        (raw > 0 && offset > 0).then(|| 1.0 / (f64::from(raw) * 1e-6) / f64::from(offset) * scale)
+    }
+
+    /// Current in amps.
+    pub fn amps(&self) -> Option<f64> {
+        Self::convert(self.amps_raw, self.amps_offset, 1e3)
+    }
+
+    /// Voltage in volts.
+    pub fn volts(&self) -> Option<f64> {
+        Self::convert(self.volts_raw, self.volts_offset, 1e5)
+    }
+
+    /// Power in watts.
+    pub fn watts(&self) -> Option<f64> {
+        Self::convert(self.watts_raw, self.watts_offset, 1e6)
+    }
+
+    /// Energy over the requested range in kWh.
+    pub fn kwh(&self) -> Option<f64> {
+        (self.energy_raw > 0 && self.energy_offset > 0).then(|| {
+            let total = f64::from(self.flag) * 2f64.powi(32) + f64::from(self.energy_raw);
+            total * 100.0 / f64::from(self.energy_offset)
+        })
+    }
+}
+
+impl fmt::Display for PowerReading {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.supported() {
+            return write!(
+                f,
+                "no metering hardware (raw a={} v={} w={})",
+                self.amps_raw, self.volts_raw, self.watts_raw
+            );
+        }
+        let show = |v: Option<f64>, unit: &str| v.map_or("n/a".to_owned(), |x| format!("{x:.2} {unit}"));
+        write!(
+            f,
+            "{} {} {} energy {} (raw a={} v={} w={} e={} offsets a={} v={} w={} e={})",
+            show(self.watts(), "W"),
+            show(self.volts(), "V"),
+            show(self.amps(), "A"),
+            show(self.kwh(), "kWh"),
+            self.amps_raw,
+            self.volts_raw,
+            self.watts_raw,
+            self.energy_raw,
+            self.amps_offset,
+            self.volts_offset,
+            self.watts_offset,
+            self.energy_offset
         )
     }
 }
@@ -584,6 +702,18 @@ impl Client {
         Ok(())
     }
 
+    /// Reads the metering block; `range` is the (start, end) dates for the energy total.
+    pub fn get_power(
+        &self,
+        device_id: &str,
+        host: IpAddr,
+        range: ((u16, u8, u8), (u16, u8, u8)),
+    ) -> Result<PowerReading> {
+        let req = PowerReading::request(range.0, range.1);
+        let reply = self.vendor(device_id, host, VCMD_READ_POWER, &req)?;
+        PowerReading::from_bytes(&reply[HEADER_LEN..]).context("power reply too short")
+    }
+
     /// Reads the plug's on-device timer table.
     pub fn get_schedule(&self, device_id: &str, host: IpAddr) -> Result<ScheduleTable> {
         let reply = self.vendor(device_id, host, VCMD_SCHEDULE_GETALL, &[])?;
@@ -791,6 +921,34 @@ mod tests {
             c.to_string(),
             "2026-09-23 14:45:00 local (standard 13:45:00, dst=true, offset=-46800s)"
         );
+    }
+
+    #[test]
+    fn power_block_layout_and_conversion() {
+        let req = PowerReading::request((2026, 9, 1), (2026, 9, 23));
+        assert_eq!(&req[4..10], &[0xEA, 0x07, 0, 0, 9, 1]);
+        assert_eq!(&req[12..18], &[0xEA, 0x07, 0, 0, 9, 23]);
+        let mut b = [0u8; 56];
+        for (at, v) in [
+            (24, 1_000_000u32),
+            (28, 1_000_000),
+            (32, 1_000_000),
+            (40, 1000),
+            (44, 1000),
+            (48, 1000),
+            (20, 1234),
+            (36, 50),
+        ] {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let r = PowerReading::from_bytes(&b).unwrap();
+        assert!(r.supported());
+        assert_eq!(r.amps(), Some(1.0));
+        assert_eq!(r.volts(), Some(100.0));
+        assert_eq!(r.watts(), Some(1000.0));
+        assert_eq!(r.kwh(), Some(2468.0));
+        assert!(!PowerReading::from_bytes(&[0u8; 56]).unwrap().supported());
+        assert!(PowerReading::from_bytes(&b[..40]).is_none());
     }
 
     #[test]

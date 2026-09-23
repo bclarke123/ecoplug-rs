@@ -10,6 +10,7 @@
 //! | DELETE | `/override` |                                        | clear override |
 //! | POST   | `/set`      | `{"power":"off"}`                      | override until the next scheduled transition |
 //! | GET    | `/metrics`  |                                        | Prometheus text |
+//! | GET    | `/power`    |                                        | live watts/volts/amps and energy, if the plug meters |
 //! | GET    | `/clock`    |                                        | the plug's clock and DST flag |
 //! | POST   | `/clock/dst`| `{"on":true}`                          | set the plug's DST flag |
 //! | GET    | `/schedule` |                                        | the plug's on-device timer table |
@@ -32,7 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::overrides::{self, Override};
-use crate::proto::{self, PlugClock, Power, ScheduleEntry, ScheduleTable};
+use crate::proto::{self, PlugClock, Power, PowerReading, ScheduleEntry, ScheduleTable};
 
 /// Fallback override length used by `/set` when the schedule never changes.
 const SET_FALLBACK: Duration = Duration::hours(24);
@@ -169,6 +170,15 @@ impl State {
 
     fn device(&self) -> (String, std::net::IpAddr) {
         self.with(|s| (s.config.device_id.clone(), s.config.host))
+    }
+
+    /// Reads live power; the energy total covers the current calendar month.
+    pub fn plug_power(&self) -> Result<PowerReading> {
+        let (id, host) = self.device();
+        let tz = self.with(|s| s.config.timezone);
+        let now = Utc::now().with_timezone(&tz);
+        let today = (now.year() as u16, now.month() as u8, now.day() as u8);
+        self.with_plug_client(|c| c.get_power(&id, host, ((today.0, today.1, 1), today)))
     }
 
     /// Reads the plug's clock and DST flag.
@@ -416,6 +426,10 @@ fn handle(state: &State, mut req: Request) {
                         Err(e) => err(500, format!("{e:#}")),
                     }
                 }
+            },
+            (Method::Get, "/power") => match state.plug_power() {
+                Ok(p) => json(200, &p),
+                Err(e) => err(502, format!("{e:#}")),
             },
             (Method::Get, "/clock") => match state.plug_clock() {
                 Ok(c) => json(200, &c),

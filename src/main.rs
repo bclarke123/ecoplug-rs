@@ -72,6 +72,8 @@ enum Cmd {
     /// Inspect or adjust the plug's clock.
     #[command(subcommand)]
     Clock(ClockCmd),
+    /// Read live power draw and this month's energy, if the plug has a meter.
+    Power,
 }
 
 #[derive(Debug, Subcommand)]
@@ -180,6 +182,15 @@ fn dispatch(cli: Cli) -> Result<()> {
         return reconcile::run(&cli.config, cfg);
     }
     let api = api_client(&cfg);
+    if let Cmd::Power = cli.cmd {
+        let p = api.power()?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&p)?);
+        } else {
+            println!("{p}");
+        }
+        return Ok(());
+    }
     if let Cmd::Clock(cc) = cli.cmd {
         let clock = match cc {
             ClockCmd::Show => api.clock()?,
@@ -230,7 +241,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             until: until_time(&cfg, u)?,
         })?,
         Cmd::Status => api.status()?,
-        Cmd::Run | Cmd::Discover { .. } | Cmd::Schedule(_) | Cmd::Clock(_) => unreachable!("handled above"),
+        Cmd::Run | Cmd::Discover { .. } | Cmd::Schedule(_) | Cmd::Clock(_) | Cmd::Power => {
+            unreachable!("handled above")
+        }
     };
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&status)?);

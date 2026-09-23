@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::api::{DstRequest, ErrorBody, OverrideRequest, SetRequest, Status};
-use crate::proto::{PlugClock, ScheduleTable};
+use crate::proto::{PlugClock, PowerReading, ScheduleTable};
 
 /// Connect and read timeout for API calls.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,6 +81,11 @@ impl Client {
     /// `DELETE /override`.
     pub fn clear_override(&self) -> Result<Status> {
         self.request("DELETE", "/override", None::<&()>)
+    }
+
+    /// `GET /power`.
+    pub fn power(&self) -> Result<PowerReading> {
+        self.request("GET", "/power", None::<&()>)
     }
 
     /// `GET /clock`.

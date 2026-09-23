@@ -104,6 +104,7 @@ ecopumpd schedule sync             # replace them with the config windows
 ecopumpd schedule clear            # delete them all
 ecopumpd clock show                # the plug's clock and DST flag
 ecopumpd clock dst on|off          # set the DST flag by hand
+ecopumpd power                     # live W/V/A and month energy, on metering models
 ```
 
 All commands accept `--config PATH` (default `/etc/ecopumpd.toml`). Set
@@ -125,6 +126,7 @@ Served on `listen` (default `127.0.0.1:8090`). If `token` is set, send
 | POST   | `/override` | `{"power":"off","until":"2026-09-23T04:00:00Z"}` | override until `until` (RFC 3339) |
 | DELETE | `/override` |                                       | clear the override |
 | GET    | `/metrics`  |                                       | Prometheus text format |
+| GET    | `/power`    |                                       | live watts, volts, amps and energy on metering models |
 | GET    | `/clock`    |                                       | the plug's clock and DST flag |
 | POST   | `/clock/dst` | `{"on":true}`                        | set the plug's DST flag |
 | GET    | `/schedule` |                                       | the plug's on-device timer table |
@@ -139,6 +141,16 @@ windows into the plug; the daemon keeps reconciling on top, so overrides still
 work. The packet format comes from the vendor app (`com.kab.unlimit`); see
 `doc/protocol.md`. Windows that cross midnight are sent as-is and it is not yet
 confirmed how the plug treats them.
+
+### Power metering
+
+Some models in this family carry an energy meter. `ecopumpd power` reads it
+using the same command and conversion the vendor app uses, and reports the raw
+values plus the factory calibration divisors alongside watts, volts, amps and
+the energy total for the current month. A plug without the hardware answers
+with zeros, which prints as "no metering hardware". The HOWT01A is one of
+those, so this is implemented but untested against a real meter; if you have
+a metering model, a reading with a known load would confirm the scale factors.
 
 The plug keeps *standard* local time and applies its timers an hour later when
 its DST flag is set. The daemon checks that flag hourly against the configured
