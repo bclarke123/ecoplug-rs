@@ -163,6 +163,51 @@ fn sync_dst(state: &State) -> Result<()> {
     Ok(())
 }
 
+/// Handles winter mode for this pass. Returns `true` when the daemon should
+/// leave the relay alone.
+fn winter_pass(state: &State) -> bool {
+    let today = state.today();
+    if let Some(season) = state.with(|s| s.winter)
+        && season.is_over(today)
+    {
+        info!(%season, "winter mode ended");
+        if let Err(e) = state.cancel_winter() {
+            warn!(error = format!("{e:#}"), "could not remove season file");
+        }
+    }
+    if state.with(|s| s.timers_restore_pending) {
+        match state.sync_plug_schedule() {
+            Ok(t) => {
+                state.with(|s| s.timers_restore_pending = false);
+                info!(timers = t.entries.len(), "on-device timers restored");
+            }
+            Err(e) => warn!(
+                error = format!("{e:#}"),
+                "on-device timers not restored yet; retrying next poll"
+            ),
+        }
+    }
+    let Some(season) = state.with(|s| s.winter) else {
+        return false;
+    };
+    if !season.is_active(today) {
+        return false;
+    }
+    if !state.with(|s| s.winter_timers_cleared) {
+        match state.clear_plug_schedule() {
+            Ok(_) => {
+                state.with(|s| s.winter_timers_cleared = true);
+                info!(%season, "winter mode active, on-device timers cleared, hands off");
+            }
+            Err(e) => warn!(
+                error = format!("{e:#}"),
+                "winter mode active but timers not cleared yet; retrying next poll"
+            ),
+        }
+    }
+    true
+}
+
 /// Runs the reconcile loop and API server until SIGTERM or SIGINT.
 ///
 /// `config_path` is re-read on SIGHUP; a bad new config is logged and the
@@ -192,10 +237,13 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
             }
         }
 
+        let hands_off = winter_pass(&state);
         let st = state.status();
         let (device_id, host, poll) =
             state.with(|s| (s.config.device_id.clone(), s.config.host, s.config.poll_interval));
-        if last_desired != Some(st.desired) {
+        if hands_off {
+            last_desired = None;
+        } else if last_desired != Some(st.desired) {
             let source = if st.r#override.is_some() {
                 "override"
             } else {
@@ -216,7 +264,9 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
             Ok(actual) => {
                 outage.record_success();
                 let mut observed = actual;
-                if actual == st.desired {
+                if hands_off {
+                    debug!(state = %actual, "winter mode, not reconciling");
+                } else if actual == st.desired {
                     debug!(state = %actual, "in sync");
                 } else {
                     match state.with_plug_client(|c| c.set_state(&device_id, host, st.desired)) {

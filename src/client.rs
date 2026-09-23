@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::api::{DstRequest, ErrorBody, OverrideRequest, SetRequest, Status};
+use crate::api::{DstRequest, ErrorBody, OverrideRequest, SetRequest, Status, WinterRequest};
 use crate::proto::{PlugClock, PowerReading, ScheduleTable};
 
 /// Connect and read timeout for API calls.
@@ -81,6 +81,16 @@ impl Client {
     /// `DELETE /override`.
     pub fn clear_override(&self) -> Result<Status> {
         self.request("DELETE", "/override", None::<&()>)
+    }
+
+    /// `POST /winter`.
+    pub fn set_winter(&self, req: WinterRequest) -> Result<Status> {
+        self.request("POST", "/winter", Some(&req))
+    }
+
+    /// `DELETE /winter`.
+    pub fn cancel_winter(&self) -> Result<Status> {
+        self.request("DELETE", "/winter", None::<&()>)
     }
 
     /// `GET /power`.

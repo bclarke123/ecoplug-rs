@@ -13,6 +13,8 @@
 //! | GET    | `/power`    |                                        | live watts/volts/amps and energy, if the plug meters |
 //! | GET    | `/clock`    |                                        | the plug's clock and DST flag |
 //! | POST   | `/clock/dst`| `{"on":true}`                          | set the plug's DST flag |
+//! | POST   | `/winter`   | `{"start":"2026-10-15","end":"2027-04-20"}` | set winter mode (end optional) |
+//! | DELETE | `/winter`   |                                        | cancel winter mode |
 //! | GET    | `/schedule` |                                        | the plug's on-device timer table |
 //! | POST   | `/schedule/sync` |                                   | replace it with the config windows |
 //! | DELETE | `/schedule` |                                        | remove every on-device timer |
@@ -26,7 +28,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 use tracing::{debug, error, info, warn};
@@ -34,6 +36,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::overrides::{self, Override};
 use crate::proto::{self, PlugClock, Power, PowerReading, ScheduleEntry, ScheduleTable};
+use crate::season::{self, Season};
 
 /// Fallback override length used by `/set` when the schedule never changes.
 const SET_FALLBACK: Duration = Duration::hours(24);
@@ -87,6 +90,26 @@ pub struct Status {
     /// Whether the last poll succeeded.
     pub reachable: bool,
     pub next: Option<Transition>,
+    /// Winter mode, if one is set (active or scheduled).
+    pub winter: Option<WinterInfo>,
+}
+
+/// Winter mode as reported by the API.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WinterInfo {
+    pub start: NaiveDate,
+    pub end: Option<NaiveDate>,
+    /// Whether today is inside the season, i.e. the daemon is hands-off.
+    pub active: bool,
+    /// Whether the plug's on-device timers have been cleared for this season.
+    pub timers_cleared: bool,
+}
+
+/// Body of `POST /winter`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WinterRequest {
+    pub start: NaiveDate,
+    pub end: Option<NaiveDate>,
 }
 
 /// Body of `POST /override`.
@@ -119,6 +142,11 @@ pub struct ErrorBody {
 pub struct Shared {
     pub config: Config,
     pub r#override: Option<Override>,
+    pub winter: Option<Season>,
+    /// Set once the on-device timers were cleared for the active season.
+    pub winter_timers_cleared: bool,
+    /// Set when a season ended or was cancelled and the timers still need syncing back.
+    pub timers_restore_pending: bool,
     pub actual: Option<Power>,
     pub last_poll: Option<DateTime<Utc>>,
     pub reachable: bool,
@@ -141,9 +169,16 @@ impl State {
             warn!(error = %e, "cannot read override file");
             None
         });
+        let winter = season::read(&config.season_file).unwrap_or_else(|e| {
+            warn!(error = %e, "cannot read season file");
+            None
+        });
         let shared = Shared {
             config,
             r#override,
+            winter,
+            winter_timers_cleared: false,
+            timers_restore_pending: false,
             actual: None,
             last_poll: None,
             reachable: false,
@@ -170,6 +205,64 @@ impl State {
 
     fn device(&self) -> (String, std::net::IpAddr) {
         self.with(|s| (s.config.device_id.clone(), s.config.host))
+    }
+
+    /// Today's date in the configured timezone.
+    pub fn today(&self) -> NaiveDate {
+        let tz = self.with(|s| s.config.timezone);
+        Utc::now().with_timezone(&tz).date_naive()
+    }
+
+    /// Whether winter mode is active right now.
+    pub fn winter_active(&self) -> bool {
+        let today = self.today();
+        self.with(|s| s.winter.is_some_and(|w| w.is_active(today)))
+    }
+
+    /// Sets winter mode, persists it, and wakes the loop.
+    pub fn set_winter(&self, season: Season) -> Result<()> {
+        self.with(|s| {
+            season::write(&s.config.season_file, season)?;
+            let same_start = s.winter.is_some_and(|w| w.start == season.start);
+            if !same_start {
+                s.winter_timers_cleared = false;
+            }
+            s.winter = Some(season);
+            Ok::<(), anyhow::Error>(())
+        })?;
+        info!(%season, "winter mode set");
+        self.wake();
+        Ok(())
+    }
+
+    /// Cancels winter mode; the loop syncs the timers back on its next pass.
+    pub fn cancel_winter(&self) -> Result<()> {
+        let was = self.with(|s| {
+            season::clear(&s.config.season_file)?;
+            let was = s.winter.take();
+            if s.winter_timers_cleared {
+                s.timers_restore_pending = true;
+            }
+            s.winter_timers_cleared = false;
+            Ok::<_, anyhow::Error>(was)
+        })?;
+        if was.is_some() {
+            info!("winter mode cancelled");
+        }
+        self.wake();
+        Ok(())
+    }
+
+    /// Switches the relay directly, bypassing schedule and overrides.
+    pub fn set_now(&self, power: Power) -> Result<()> {
+        let (id, host) = self.device();
+        self.with_plug_client(|c| c.set_state(&id, host, power))?;
+        self.with(|s| {
+            s.actual = Some(power);
+            s.last_poll = Some(Utc::now());
+        });
+        info!(%power, "switched plug directly");
+        Ok(())
     }
 
     /// Reads live power; the energy total covers the current calendar month.
@@ -311,6 +404,12 @@ impl State {
         self.with(|s| {
             let local = now.with_timezone(&s.config.timezone);
             let schedule = Power::from_bool(s.config.schedule.desired(local));
+            let winter = s.winter.map(|w| WinterInfo {
+                start: w.start,
+                end: w.end,
+                active: w.is_active(local.date_naive()),
+                timers_cleared: s.winter_timers_cleared,
+            });
             Status {
                 now,
                 timezone: s.config.timezone.name().to_owned(),
@@ -327,6 +426,7 @@ impl State {
                     power: Power::from_bool(on),
                     at: t.with_timezone(&Utc),
                 }),
+                winter,
             }
         })
     }
@@ -400,6 +500,7 @@ fn handle(state: &State, mut req: Request) {
                 .with_header(Header::from_bytes("Content-Type", "text/plain; version=0.0.4").expect("static header")),
             (Method::Post, "/override") => match read_body::<OverrideRequest>(&mut req) {
                 Err(e) => err(400, e.to_string()),
+                Ok(_) if state.winter_active() => err(409, "winter mode is active; use on/off for a direct switch"),
                 Ok(r) if r.until <= Utc::now() => err(400, "until is in the past"),
                 Ok(r) => match state.set_override(Some(Override {
                     power: r.power,
@@ -415,6 +516,10 @@ fn handle(state: &State, mut req: Request) {
             },
             (Method::Post, "/set") => match read_body::<SetRequest>(&mut req) {
                 Err(e) => err(400, e.to_string()),
+                Ok(r) if state.winter_active() => match state.set_now(r.power) {
+                    Ok(()) => json(200, &state.status()),
+                    Err(e) => err(502, format!("{e:#}")),
+                },
                 Ok(r) => {
                     let now = Utc::now();
                     let until = state
@@ -426,6 +531,17 @@ fn handle(state: &State, mut req: Request) {
                         Err(e) => err(500, format!("{e:#}")),
                     }
                 }
+            },
+            (Method::Post, "/winter") => match read_body::<WinterRequest>(&mut req) {
+                Err(e) => err(400, e.to_string()),
+                Ok(r) => match Season::new(r.start, r.end).and_then(|s| state.set_winter(s)) {
+                    Ok(()) => json(200, &state.status()),
+                    Err(e) => err(400, format!("{e:#}")),
+                },
+            },
+            (Method::Delete, "/winter") => match state.cancel_winter() {
+                Ok(()) => json(200, &state.status()),
+                Err(e) => err(500, format!("{e:#}")),
             },
             (Method::Get, "/power") => match state.plug_power() {
                 Ok(p) => json(200, &p),
@@ -513,6 +629,33 @@ mod tests {
         assert_eq!(st.r#override.map(|o| o.until.timestamp()), Some(until.timestamp()));
         state.set_override(None).unwrap();
         assert!(state.status().r#override.is_none());
+    }
+
+    #[test]
+    fn winter_mode_state() {
+        let mut cfg = Config::parse(include_str!("../deploy/ecopumpd.toml")).unwrap();
+        let dir = std::env::temp_dir().join(format!("ecopumpd-winter-{}", std::process::id()));
+        cfg.override_file = dir.join("override");
+        cfg.season_file = dir.join("season");
+        let state = State::new(cfg);
+        assert!(state.status().winter.is_none());
+        let today = state.today();
+        let season = Season::new(today - Duration::days(1), Some(today + Duration::days(30))).unwrap();
+        state.set_winter(season).unwrap();
+        let w = state.status().winter.unwrap();
+        assert!(w.active);
+        assert!(!w.timers_cleared);
+        assert!(state.winter_active());
+        let future = Season::new(today + Duration::days(5), None).unwrap();
+        state.set_winter(future).unwrap();
+        assert!(!state.winter_active());
+        state.cancel_winter().unwrap();
+        assert!(state.status().winter.is_none());
+        // Cancelling after the timers were cleared schedules their restoration.
+        state.set_winter(season).unwrap();
+        state.with(|s| s.winter_timers_cleared = true);
+        state.cancel_winter().unwrap();
+        assert!(state.with(|s| s.timers_restore_pending));
     }
 
     #[test]

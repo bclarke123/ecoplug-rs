@@ -25,6 +25,8 @@ all of it, verified against a real HOWT01A (firmware 1.7.1).
   vendor app leaves to a checkbox.
 - Temporary overrides (`on --for 2h`, `off --until 06:00`) that expire on
   their own and survive daemon restarts.
+- Winter mode: between two dates the daemon leaves the relay alone and clears
+  the plug's timers, then puts everything back when the season ends.
 - A small HTTP API on localhost that the CLI uses and that Home Assistant can
   poll, plus a Prometheus `/metrics` endpoint.
 - Single static binary, one TOML config, `tracing` logs that read well under
@@ -105,6 +107,9 @@ ecopumpd schedule clear            # delete them all
 ecopumpd clock show                # the plug's clock and DST flag
 ecopumpd clock dst on|off          # set the DST flag by hand
 ecopumpd power                     # live W/V/A and month energy, on metering models
+ecopumpd winter start 2026-10-15   # hands off from that date (today or earlier: now)
+ecopumpd winter end 2027-04-20     # resume on that date; starts winter today if not set
+ecopumpd winter cancel             # back to normal on the next poll
 ```
 
 All commands accept `--config PATH` (default `/etc/ecopumpd.toml`). Set
@@ -126,6 +131,8 @@ Served on `listen` (default `127.0.0.1:8090`). If `token` is set, send
 | POST   | `/override` | `{"power":"off","until":"2026-09-23T04:00:00Z"}` | override until `until` (RFC 3339) |
 | DELETE | `/override` |                                       | clear the override |
 | GET    | `/metrics`  |                                       | Prometheus text format |
+| POST   | `/winter`   | `{"start":"2026-10-15","end":"2027-04-20"}` | set winter mode; `end` optional |
+| DELETE | `/winter`   |                                       | cancel winter mode |
 | GET    | `/power`    |                                       | live watts, volts, amps and energy on metering models |
 | GET    | `/clock`    |                                       | the plug's clock and DST flag |
 | POST   | `/clock/dst` | `{"on":true}`                        | set the plug's DST flag |
@@ -141,6 +148,17 @@ windows into the plug; the daemon keeps reconciling on top, so overrides still
 work. The packet format comes from the vendor app (`com.kab.unlimit`); see
 `doc/protocol.md`. Windows that cross midnight are sent as-is and it is not yet
 confirmed how the plug treats them.
+
+### Winter mode
+
+For the closed season, or any time people are working on the pump, `winter`
+sets a date range during which the daemon keeps its hands off. On the first
+poll inside the range it clears the plug's on-device timers; from then on it
+only observes, so the plug's button does what it says. Overrides are refused,
+but `ecopumpd on` and `off` still switch the relay directly. On the end date
+it syncs the timers back from the config and resumes reconciling. The dates
+are local midnights, the state survives restarts, and the config windows are
+never touched, so there is nothing to restore by hand in spring.
 
 ### Power metering
 

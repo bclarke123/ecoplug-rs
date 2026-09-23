@@ -33,6 +33,8 @@ struct RawConfig {
     poll_interval_secs: u64,
     #[serde(default = "default_override_file")]
     override_file: PathBuf,
+    #[serde(default = "default_season_file")]
+    season_file: PathBuf,
     #[serde(default)]
     windows: Vec<RawWindow>,
 }
@@ -62,6 +64,10 @@ fn default_override_file() -> PathBuf {
     PathBuf::from("/var/lib/ecopumpd/override")
 }
 
+fn default_season_file() -> PathBuf {
+    PathBuf::from("/var/lib/ecopumpd/season")
+}
+
 /// Validated daemon configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -76,6 +82,8 @@ pub struct Config {
     pub token: Option<String>,
     pub poll_interval: Duration,
     pub override_file: PathBuf,
+    /// Where winter mode is persisted.
+    pub season_file: PathBuf,
     pub schedule: Schedule,
 }
 
@@ -136,6 +144,7 @@ impl Config {
             token: raw.token,
             poll_interval: Duration::from_secs(raw.poll_interval_secs),
             override_file: raw.override_file,
+            season_file: raw.season_file,
             schedule: Schedule::new(windows),
         })
     }

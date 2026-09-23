@@ -11,6 +11,7 @@ mod overrides;
 mod proto;
 mod reconcile;
 mod schedule;
+mod season;
 
 use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr};
@@ -25,7 +26,8 @@ use clap::{Args, Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use api::{OverrideRequest, SetRequest, Status};
+use api::{OverrideRequest, SetRequest, Status, WinterRequest};
+use chrono::NaiveDate;
 use config::Config;
 use proto::Power;
 use schedule::Hm;
@@ -74,6 +76,19 @@ enum Cmd {
     Clock(ClockCmd),
     /// Read live power draw and this month's energy, if the plug has a meter.
     Power,
+    /// Winter mode: hands off the relay and no on-device timers between two dates.
+    #[command(subcommand)]
+    Winter(WinterCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum WinterCmd {
+    /// Start winter mode on DATE (YYYY-MM-DD, today or earlier starts now). Keeps any end date.
+    Start { date: NaiveDate },
+    /// Resume normal operation on DATE. Starts winter today if none is set.
+    End { date: NaiveDate },
+    /// Cancel winter mode now; on-device timers are restored on the next poll.
+    Cancel,
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,6 +197,28 @@ fn dispatch(cli: Cli) -> Result<()> {
         return reconcile::run(&cli.config, cfg);
     }
     let api = api_client(&cfg);
+    if let Cmd::Winter(wc) = cli.cmd {
+        let status = match wc {
+            WinterCmd::Start { date } => {
+                let end = api.status()?.winter.and_then(|w| w.end);
+                api.set_winter(WinterRequest { start: date, end })?
+            }
+            WinterCmd::End { date } => {
+                let start = api
+                    .status()?
+                    .winter
+                    .map_or_else(|| Utc::now().with_timezone(&cfg.timezone).date_naive(), |w| w.start);
+                api.set_winter(WinterRequest { start, end: Some(date) })?
+            }
+            WinterCmd::Cancel => api.cancel_winter()?,
+        };
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        } else {
+            print_status(&status, cfg.timezone);
+        }
+        return Ok(());
+    }
     if let Cmd::Power = cli.cmd {
         let p = api.power()?;
         if cli.json {
@@ -241,7 +278,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             until: until_time(&cfg, u)?,
         })?,
         Cmd::Status => api.status()?,
-        Cmd::Run | Cmd::Discover { .. } | Cmd::Schedule(_) | Cmd::Clock(_) | Cmd::Power => {
+        Cmd::Run | Cmd::Discover { .. } | Cmd::Schedule(_) | Cmd::Clock(_) | Cmd::Power | Cmd::Winter(_) => {
             unreachable!("handled above")
         }
     };
@@ -287,7 +324,27 @@ fn print_status(st: &Status, tz: Tz) {
         Some(o) => println!("override:   {} until {}", o.power, fmt(o.until)),
         None => println!("override:   none"),
     }
-    println!("desired:    {}", st.desired);
+    match st.winter {
+        Some(w) => {
+            let end = w.end.map_or("cancelled".to_owned(), |e| e.to_string());
+            let phase = if w.active {
+                if w.timers_cleared {
+                    "active, hands off"
+                } else {
+                    "active, timers not yet cleared"
+                }
+            } else {
+                "scheduled"
+            };
+            println!("winter:     {} until {} ({phase})", w.start, end);
+        }
+        None => println!("winter:     off"),
+    }
+    if st.winter.is_some_and(|w| w.active) {
+        println!("desired:    hands off (winter)");
+    } else {
+        println!("desired:    {}", st.desired);
+    }
     match (st.actual, st.last_poll) {
         (Some(a), Some(t)) => {
             let sync = if a == st.desired { "" } else { "  (out of sync)" };
