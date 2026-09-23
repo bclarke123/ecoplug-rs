@@ -66,6 +66,33 @@ enum Cmd {
     Override(OverrideCmd),
     /// Show desired vs actual state, the active override and the next transition.
     Status,
+    /// Inspect or program the plug's own on-device timers.
+    #[command(subcommand)]
+    Schedule(ScheduleCmd),
+    /// Inspect or adjust the plug's clock.
+    #[command(subcommand)]
+    Clock(ClockCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum ClockCmd {
+    /// Show the plug's clock and DST flag.
+    Show,
+    /// Turn the plug's daylight-saving flag on or off.
+    Dst {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScheduleCmd {
+    /// List the timers stored on the plug.
+    Show,
+    /// Replace the plug's timers with the windows from the config file.
+    Sync,
+    /// Delete every timer stored on the plug.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -153,6 +180,35 @@ fn dispatch(cli: Cli) -> Result<()> {
         return reconcile::run(&cli.config, cfg);
     }
     let api = api_client(&cfg);
+    if let Cmd::Clock(cc) = cli.cmd {
+        let clock = match cc {
+            ClockCmd::Show => api.clock()?,
+            ClockCmd::Dst { state } => api.set_dst(state == "on")?,
+        };
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&clock)?);
+        } else {
+            println!("{clock}");
+        }
+        return Ok(());
+    }
+    if let Cmd::Schedule(sc) = cli.cmd {
+        let table = match sc {
+            ScheduleCmd::Show => api.schedule()?,
+            ScheduleCmd::Sync => api.sync_schedule()?,
+            ScheduleCmd::Clear => api.clear_schedule()?,
+        };
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&table)?);
+        } else if table.entries.is_empty() {
+            println!("no timers stored on the plug");
+        } else {
+            for e in &table.entries {
+                println!("{e}");
+            }
+        }
+        return Ok(());
+    }
     let status = match cli.cmd {
         Cmd::State => {
             let st = api.status()?;
@@ -174,7 +230,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             until: until_time(&cfg, u)?,
         })?,
         Cmd::Status => api.status()?,
-        Cmd::Run | Cmd::Discover { .. } => unreachable!("handled above"),
+        Cmd::Run | Cmd::Discover { .. } | Cmd::Schedule(_) | Cmd::Clock(_) => unreachable!("handled above"),
     };
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&status)?);

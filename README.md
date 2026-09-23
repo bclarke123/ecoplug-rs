@@ -8,14 +8,21 @@ It reconciles rather than fires and forgets: every poll it computes the desired
 state from the schedule, reads the plug's actual state, and corrects it only if
 they differ. Missed packets, power cuts and manual button presses self-heal.
 
-The protocol was reverse-engineered by
-[Danimal4326/homebridge-ecoplug](https://github.com/Danimal4326/homebridge-ecoplug);
-see `doc/plan.md` for the packet layout and design notes.
+It also programs the plug's **own on-device timers**, so the schedule keeps
+running even if the host goes down. As far as we know this is the first
+third-party implementation of the ECO Plugs timer and clock commands; the
+on/off protocol came from
+[Danimal4326/homebridge-ecoplug](https://github.com/Danimal4326/homebridge-ecoplug)
+and the rest was recovered from the vendor app. `doc/protocol.md` documents
+all of it, verified against a real HOWT01A (firmware 1.7.1).
 
 ## Features
 
 - Schedule made of on-windows in a local timezone; windows may cross midnight
   and can be limited to certain weekdays. DST just works.
+- One command pushes the same windows into the plug's own 12-slot timer table,
+  and the daemon keeps the plug's daylight-saving flag correct, which the
+  vendor app leaves to a checkbox.
 - Temporary overrides (`on --for 2h`, `off --until 06:00`) that expire on
   their own and survive daemon restarts.
 - A small HTTP API on localhost that the CLI uses and that Home Assistant can
@@ -92,6 +99,11 @@ ecopumpd override on --for 2h
 ecopumpd override off --until 06:00
 ecopumpd override clear
 ecopumpd status [--json]           # desired vs actual, override, next transition
+ecopumpd schedule show             # timers stored on the plug itself
+ecopumpd schedule sync             # replace them with the config windows
+ecopumpd schedule clear            # delete them all
+ecopumpd clock show                # the plug's clock and DST flag
+ecopumpd clock dst on|off          # set the DST flag by hand
 ```
 
 All commands accept `--config PATH` (default `/etc/ecopumpd.toml`). Set
@@ -113,6 +125,24 @@ Served on `listen` (default `127.0.0.1:8090`). If `token` is set, send
 | POST   | `/override` | `{"power":"off","until":"2026-09-23T04:00:00Z"}` | override until `until` (RFC 3339) |
 | DELETE | `/override` |                                       | clear the override |
 | GET    | `/metrics`  |                                       | Prometheus text format |
+| GET    | `/clock`    |                                       | the plug's clock and DST flag |
+| POST   | `/clock/dst` | `{"on":true}`                        | set the plug's DST flag |
+| GET    | `/schedule` |                                       | the plug's on-device timer table |
+| POST   | `/schedule/sync` |                                  | replace it with the config windows |
+| DELETE | `/schedule` |                                       | remove every on-device timer |
+
+### On-device timers
+
+The plug can store up to 12 weekly timers of its own, which keep running if the
+host running `ecopumpd` goes down. `ecopumpd schedule sync` programs the config
+windows into the plug; the daemon keeps reconciling on top, so overrides still
+work. The packet format comes from the vendor app (`com.kab.unlimit`); see
+`doc/protocol.md`. Windows that cross midnight are sent as-is and it is not yet
+confirmed how the plug treats them.
+
+The plug keeps *standard* local time and applies its timers an hour later when
+its DST flag is set. The daemon checks that flag hourly against the configured
+timezone and corrects it, so the spring and autumn changes need no attention.
 
 ### Home Assistant
 

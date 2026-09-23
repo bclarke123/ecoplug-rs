@@ -92,6 +92,29 @@ impl Window {
         Ok(Self { start, end, days: mask })
     }
 
+    /// Start of the window (inclusive).
+    pub fn start(&self) -> Hm {
+        self.start
+    }
+
+    /// End of the window (exclusive).
+    pub fn end(&self) -> Hm {
+        self.end
+    }
+
+    /// Days the window starts on, as the plug's bitmask (Sun=0x40 .. Sat=0x01).
+    pub fn days_mask(&self) -> u8 {
+        // self.days is indexed Mon=0..Sun=6; the plug counts Sun=bit6 .. Sat=bit0.
+        let mut mask = 0u8;
+        for (i, on) in self.days.iter().enumerate() {
+            if *on {
+                let plug_index = (i + 1) % 7; // Mon->1 .. Sat->6, Sun->0
+                mask |= 0x40 >> plug_index;
+            }
+        }
+        mask
+    }
+
     fn crosses_midnight(&self) -> bool {
         self.end < self.start
     }
@@ -255,6 +278,15 @@ mod tests {
         assert!(!on);
         assert_eq!(t, at(2026, 9, 22, 17, 0));
         assert!(Schedule::default().next_transition(at(2026, 9, 22, 9, 0)).is_none());
+    }
+
+    #[test]
+    fn days_mask_matches_plug_bit_order() {
+        assert_eq!(win("09:00", "17:00", &[]).days_mask(), 0x7F);
+        assert_eq!(win("09:00", "17:00", &[Weekday::Sun]).days_mask(), 0x40);
+        assert_eq!(win("09:00", "17:00", &[Weekday::Mon]).days_mask(), 0x20);
+        assert_eq!(win("09:00", "17:00", &[Weekday::Sat]).days_mask(), 0x01);
+        assert_eq!(win("09:00", "17:00", &[Weekday::Mon, Weekday::Fri]).days_mask(), 0x22);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use chrono_tz::OffsetComponents;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use tracing::{debug, error, info, warn};
 
@@ -28,6 +29,8 @@ const WARN_EVERY: Duration = Duration::from_secs(300);
 const PROLONGED_OUTAGE: Duration = Duration::from_secs(30 * 60);
 /// Granularity at which the sleep checks for signals.
 const TICK: Duration = Duration::from_secs(1);
+/// How often the plug's DST flag is checked against the configured timezone.
+const DST_CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// Extra delay past a scheduled transition so the poll lands just after it.
 const TRANSITION_MARGIN: Duration = Duration::from_millis(500);
 
@@ -138,6 +141,28 @@ fn sleep_interruptible(dur: Duration, signals: &Signals, state: &State) {
     }
 }
 
+/// Whether `tz` is observing daylight saving at `now`.
+fn dst_active(tz: chrono_tz::Tz, now: chrono::DateTime<Utc>) -> bool {
+    !now.with_timezone(&tz).offset().dst_offset().is_zero()
+}
+
+/// Makes the plug's DST flag match whether the configured timezone is in DST now.
+///
+/// The plug keeps standard local time and applies its timers an hour later
+/// when the flag is set, so a stale flag makes on-device timers fire an hour off.
+fn sync_dst(state: &State) -> Result<()> {
+    let tz = state.with(|s| s.config.timezone);
+    let want = dst_active(tz, Utc::now());
+    let clock = state.plug_clock()?;
+    if clock.dst == want {
+        debug!(dst = want, plug_clock = %clock, "plug dst flag in sync");
+        return Ok(());
+    }
+    let after = state.set_plug_dst(want)?;
+    info!(from = clock.dst, to = want, plug_clock = %after, "corrected plug dst flag");
+    Ok(())
+}
+
 /// Runs the reconcile loop and API server until SIGTERM or SIGINT.
 ///
 /// `config_path` is re-read on SIGHUP; a bad new config is logged and the
@@ -150,10 +175,11 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
         poll_secs = config.poll_interval.as_secs(), windows = config.schedule.windows().len(),
         "ecopumpd starting"
     );
-    let state = State::new(config);
+    let state = State::new(config).with_plug(client);
     api::serve(state.clone())?;
     let mut outage = Outage::default();
     let mut last_desired: Option<Power> = None;
+    let mut last_dst_check: Option<Instant> = None;
 
     while !signals.shutting_down() {
         if signals.take_reload() {
@@ -179,7 +205,7 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
             last_desired = Some(st.desired);
         }
 
-        let wait = match client.get_state(&device_id, host) {
+        let wait = match state.with_plug_client(|c| c.get_state(&device_id, host)) {
             Err(e) => {
                 state.with(|s| {
                     s.reachable = false;
@@ -193,7 +219,7 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
                 if actual == st.desired {
                     debug!(state = %actual, "in sync");
                 } else {
-                    match client.set_state(&device_id, host, st.desired) {
+                    match state.with_plug_client(|c| c.set_state(&device_id, host, st.desired)) {
                         Ok(()) => {
                             observed = st.desired;
                             info!(from = %actual, to = %st.desired, "corrected plug state");
@@ -210,6 +236,12 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
             }
         };
         let wait = clamp_to_transition(wait, Utc::now(), st.next.map(|n| n.at));
+        if outage.since.is_none() && last_dst_check.is_none_or(|t| t.elapsed() >= DST_CHECK_EVERY) {
+            last_dst_check = Some(Instant::now());
+            if let Err(e) = sync_dst(&state) {
+                warn!(error = format!("{e:#}"), "could not check plug dst flag");
+            }
+        }
         sleep_interruptible(wait, &signals, &state);
     }
     info!("ecopumpd stopping");
@@ -220,6 +252,16 @@ pub fn run(config_path: &Path, config: Config) -> Result<()> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn dst_detection() {
+        let toronto = chrono_tz::America::Toronto;
+        let july = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+        let january = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        assert!(dst_active(toronto, july));
+        assert!(!dst_active(toronto, january));
+        assert!(!dst_active(chrono_tz::UTC, july));
+    }
 
     #[test]
     fn wakes_for_transition_when_sooner() {

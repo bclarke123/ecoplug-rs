@@ -11,7 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::api::{ErrorBody, OverrideRequest, SetRequest, Status};
+use crate::api::{DstRequest, ErrorBody, OverrideRequest, SetRequest, Status};
+use crate::proto::{PlugClock, ScheduleTable};
 
 /// Connect and read timeout for API calls.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,6 +81,31 @@ impl Client {
     /// `DELETE /override`.
     pub fn clear_override(&self) -> Result<Status> {
         self.request("DELETE", "/override", None::<&()>)
+    }
+
+    /// `GET /clock`.
+    pub fn clock(&self) -> Result<PlugClock> {
+        self.request("GET", "/clock", None::<&()>)
+    }
+
+    /// `POST /clock/dst`.
+    pub fn set_dst(&self, on: bool) -> Result<PlugClock> {
+        self.request("POST", "/clock/dst", Some(&DstRequest { on }))
+    }
+
+    /// `GET /schedule`.
+    pub fn schedule(&self) -> Result<ScheduleTable> {
+        self.request("GET", "/schedule", None::<&()>)
+    }
+
+    /// `POST /schedule/sync`.
+    pub fn sync_schedule(&self) -> Result<ScheduleTable> {
+        self.request("POST", "/schedule/sync", None::<&()>)
+    }
+
+    /// `DELETE /schedule`.
+    pub fn clear_schedule(&self) -> Result<ScheduleTable> {
+        self.request("DELETE", "/schedule", None::<&()>)
     }
 }
 

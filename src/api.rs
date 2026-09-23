@@ -10,6 +10,11 @@
 //! | DELETE | `/override` |                                        | clear override |
 //! | POST   | `/set`      | `{"power":"off"}`                      | override until the next scheduled transition |
 //! | GET    | `/metrics`  |                                        | Prometheus text |
+//! | GET    | `/clock`    |                                        | the plug's clock and DST flag |
+//! | POST   | `/clock/dst`| `{"on":true}`                          | set the plug's DST flag |
+//! | GET    | `/schedule` |                                        | the plug's on-device timer table |
+//! | POST   | `/schedule/sync` |                                   | replace it with the config windows |
+//! | DELETE | `/schedule` |                                        | remove every on-device timer |
 //!
 //! Errors are `{"error": "..."}` with a 4xx/5xx status. When a `token` is
 //! configured, requests must carry `Authorization: Bearer <token>`.
@@ -19,15 +24,15 @@ use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Duration, Utc};
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::overrides::{self, Override};
-use crate::proto::Power;
+use crate::proto::{self, PlugClock, Power, ScheduleEntry, ScheduleTable};
 
 /// Fallback override length used by `/set` when the schedule never changes.
 const SET_FALLBACK: Duration = Duration::hours(24);
@@ -96,6 +101,12 @@ pub struct SetRequest {
     pub power: Power,
 }
 
+/// Body of `POST /clock/dst`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DstRequest {
+    pub on: bool,
+}
+
 /// Error body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
@@ -114,9 +125,13 @@ pub struct Shared {
     pub wake: bool,
 }
 
-/// Handle to [`Shared`] plus the condvar used to wake the loop.
+/// Handle to [`Shared`] plus the condvar used to wake the loop and the
+/// UDP client shared with the API thread.
 #[derive(Debug, Clone)]
-pub struct State(Arc<(Mutex<Shared>, Condvar)>);
+pub struct State {
+    inner: Arc<(Mutex<Shared>, Condvar)>,
+    plug: Option<Arc<Mutex<proto::Client>>>,
+}
 
 impl State {
     /// Creates state for `config` with the override loaded from disk.
@@ -133,18 +148,104 @@ impl State {
             reachable: false,
             wake: false,
         };
-        Self(Arc::new((Mutex::new(shared), Condvar::new())))
+        Self {
+            inner: Arc::new((Mutex::new(shared), Condvar::new())),
+            plug: None,
+        }
+    }
+
+    /// Attaches the UDP client so both the loop and the API can use it.
+    pub fn with_plug(mut self, client: proto::Client) -> Self {
+        self.plug = Some(Arc::new(Mutex::new(client)));
+        self
+    }
+
+    /// Runs `f` with exclusive use of the UDP client.
+    pub fn with_plug_client<R>(&self, f: impl FnOnce(&proto::Client) -> Result<R>) -> Result<R> {
+        let plug = self.plug.as_ref().ok_or_else(|| anyhow!("no plug client attached"))?;
+        let guard = plug.lock().unwrap_or_else(|p| p.into_inner());
+        f(&guard)
+    }
+
+    fn device(&self) -> (String, std::net::IpAddr) {
+        self.with(|s| (s.config.device_id.clone(), s.config.host))
+    }
+
+    /// Reads the plug's clock and DST flag.
+    pub fn plug_clock(&self) -> Result<PlugClock> {
+        let (id, host) = self.device();
+        self.with_plug_client(|c| c.get_clock(&id, host))
+    }
+
+    /// Sets the plug's DST flag and reads the clock back.
+    pub fn set_plug_dst(&self, on: bool) -> Result<PlugClock> {
+        let (id, host) = self.device();
+        self.with_plug_client(|c| {
+            c.set_dst(&id, host, on)?;
+            info!(on, "set plug dst flag");
+            c.get_clock(&id, host)
+        })
+    }
+
+    /// Reads the on-device timer table.
+    pub fn plug_schedule(&self) -> Result<ScheduleTable> {
+        let (id, host) = self.device();
+        self.with_plug_client(|c| c.get_schedule(&id, host))
+    }
+
+    /// Deletes every on-device timer, one at a time as the app does.
+    pub fn clear_plug_schedule(&self) -> Result<ScheduleTable> {
+        let (id, host) = self.device();
+        self.with_plug_client(|c| {
+            let mut table = c.get_schedule(&id, host)?;
+            while let Some(e) = table.entries.first().copied() {
+                c.delete_schedule_entry(&id, host, &mut table, e.id)?;
+                info!(entry = %e, "removed on-device timer");
+            }
+            Ok(table)
+        })
+    }
+
+    /// Replaces the on-device timers with the configured windows.
+    pub fn sync_plug_schedule(&self) -> Result<ScheduleTable> {
+        let (windows, tz) = self.with(|s| (s.config.schedule.windows().to_vec(), s.config.timezone));
+        if windows.len() > proto::SCHEDULE_SLOTS {
+            bail!(
+                "config has {} windows but the plug stores at most {}",
+                windows.len(),
+                proto::SCHEDULE_SLOTS
+            );
+        }
+        let mut table = self.clear_plug_schedule()?;
+        let (id, host) = self.device();
+        let today = Utc::now().with_timezone(&tz);
+        let today = (today.year() as u16, today.month() as u8, today.day() as u8);
+        self.with_plug_client(|c| {
+            for w in &windows {
+                let slot = table.free_id().ok_or_else(|| anyhow!("no free timer slot"))?;
+                let entry = ScheduleEntry::weekly(
+                    slot,
+                    w.days_mask(),
+                    u32::from(w.start().minutes()) * 60,
+                    u32::from(w.end().minutes()) * 60,
+                    today,
+                );
+                c.add_schedule_entry(&id, host, &mut table, entry)?;
+                info!(entry = %entry, "added on-device timer");
+            }
+            Ok(table)
+        })
     }
 
     /// Runs `f` with the lock held.
     pub fn with<R>(&self, f: impl FnOnce(&mut Shared) -> R) -> R {
-        let mut guard = self.0.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.0.lock().unwrap_or_else(|p| p.into_inner());
         f(&mut guard)
     }
 
     /// Blocks up to `timeout` or until [`State::wake`] is called.
     pub fn wait(&self, timeout: std::time::Duration) {
-        let (lock, cv) = &*self.0;
+        let (lock, cv) = &*self.inner;
         let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let (mut guard, _) = cv
             .wait_timeout_while(guard, timeout, |s| !s.wake)
@@ -155,7 +256,7 @@ impl State {
     /// Wakes the reconcile loop.
     pub fn wake(&self) {
         self.with(|s| s.wake = true);
-        self.0.1.notify_all();
+        self.inner.1.notify_all();
     }
 
     /// Drops any expired override and returns the active one.
@@ -315,6 +416,29 @@ fn handle(state: &State, mut req: Request) {
                         Err(e) => err(500, format!("{e:#}")),
                     }
                 }
+            },
+            (Method::Get, "/clock") => match state.plug_clock() {
+                Ok(c) => json(200, &c),
+                Err(e) => err(502, format!("{e:#}")),
+            },
+            (Method::Post, "/clock/dst") => match read_body::<DstRequest>(&mut req) {
+                Err(e) => err(400, e.to_string()),
+                Ok(r) => match state.set_plug_dst(r.on) {
+                    Ok(c) => json(200, &c),
+                    Err(e) => err(502, format!("{e:#}")),
+                },
+            },
+            (Method::Get, "/schedule") => match state.plug_schedule() {
+                Ok(t) => json(200, &t),
+                Err(e) => err(502, format!("{e:#}")),
+            },
+            (Method::Post, "/schedule/sync") => match state.sync_plug_schedule() {
+                Ok(t) => json(200, &t),
+                Err(e) => err(502, format!("{e:#}")),
+            },
+            (Method::Delete, "/schedule") => match state.clear_plug_schedule() {
+                Ok(t) => json(200, &t),
+                Err(e) => err(502, format!("{e:#}")),
             },
             _ => err(404, "no such endpoint"),
         }
